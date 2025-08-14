@@ -1,0 +1,124 @@
+name: Deploy to k3s on EC2 (via SSM)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (defaults to commit SHA)"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: eu-west-2
+  IMAGE_TAG: ${{ github.event.inputs.image_tag != '' && github.event.inputs.image_tag || github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      # Secrets you must have set in repo settings
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}          # e.g. 389890955868.dkr.ecr.eu-west-2.amazonaws.com
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ECR password on runner (base64-encode)
+        id: ecrpw
+        shell: bash
+        run: |
+          set -euo pipefail
+          PW="$(aws ecr get-login-password --region "${AWS_REGION}")"
+          PW_B64="$(printf %s "$PW" | base64 -w0)"
+          echo "pw_b64=${PW_B64}" >> "$GITHUB_OUTPUT"
+
+      # IMPORTANT: scripts/deploy-k3s.sh must exist in your repo (in main)
+      # The SSM payload is tiny: export env -> curl script -> run it.
+      - name: Send SSM command (tiny payload, with fallback + debug)
+        id: ssm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RAW_SHA="https://raw.githubusercontent.com/Uthmanade001/example-voting-app/${IMAGE_TAG}/scripts/deploy-k3s.sh"
+          RAW_MAIN="https://raw.githubusercontent.com/Uthmanade001/example-voting-app/main/scripts/deploy-k3s.sh"
+
+          cat > params.json <<JSON
+          {
+            "commands": [
+              "set -euo pipefail",
+              "echo 'SMOKE: SSM connected at ' \$(date)",
+              "export AWS_REGION='${AWS_REGION}' ECR='${ECR_REGISTRY}' TAG='${IMAGE_TAG}' PUSER='${POSTGRES_USER}' PPASS='${POSTGRES_PASSWORD}' PDB='${POSTGRES_DB}' ECR_PW_B64='${{ steps.ecrpw.outputs.pw_b64 }}'",
+              "echo 'Trying commit URL: ${RAW_SHA}'",
+              "if curl -fsSL '${RAW_SHA}' -o /tmp/deploy-k3s.sh; then echo 'Using commit script'; else echo 'Commit script not found, falling back to main: ${RAW_MAIN}'; curl -fsSL '${RAW_MAIN}' -o /tmp/deploy-k3s.sh; fi",
+              "chmod +x /tmp/deploy-k3s.sh",
+              "bash -x /tmp/deploy-k3s.sh"
+            ]
+          }
+          JSON
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "k3s deploy with fallback + debug" \
+            --parameters file://params.json \
+            --query "Command.CommandId" --output text)
+
+          if [ -z "$CMD_ID" ] || [ "$CMD_ID" = "None" ]; then
+            echo "Failed to get CommandId from send-command"
+            echo "params.json content:"; cat params.json
+            exit 1
+          fi
+
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command sent: $CMD_ID"
+
+      - name: Wait for SSM command to finish
+        shell: bash
+        run: |
+          set -e
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          echo "Waiting on SSM Command: $CMD_ID"
+          for i in {1..60}; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" --details \
+              --query 'CommandInvocations[0].Status' --output text || true)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then exit 0; fi
+            if [[ "$STATUS" = "Cancelled" || "$STATUS" = "TimedOut" || "$STATUS" = "Failed" || "$STATUS" = "Undeliverable" || "$STATUS" = "Incomplete" ]]; then
+              echo "SSM command ended with status: $STATUS"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for SSM command to finish"
+          exit 1
+
+      - name: Fetch SSM logs (full details)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          INSTANCE="${EC2_INSTANCE_ID}"
+          echo "=== get-command-invocation ==="
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE" \
+            --output json || true
+          echo "=== list-command-invocations (with details) ==="
+          aws ssm list-command-invocations \
+            --command-id "$CMD_ID" \
+            --details \
+            --output json || true

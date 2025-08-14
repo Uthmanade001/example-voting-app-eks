@@ -1,0 +1,40 @@
+name: Check EC2 status via SSM
+on: workflow_dispatch
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send SSM command
+        id: ssm
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "compose status" \
+            --parameters commands='[
+              "cd /opt/vote",
+              "docker compose ps",
+              "docker ps --format '\''table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'\''",
+              "docker images | head -n 15"
+            ]' \
+            --query "Command.CommandId" --output text)
+          echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
+      - name: Fetch output
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+            --output json \
+            --query '{Status:Status, StdOut:StandardOutputContent, StdErr:StandardErrorContent}'

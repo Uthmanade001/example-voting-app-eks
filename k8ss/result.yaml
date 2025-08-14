@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: result
+  namespace: voting
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: result }
+  template:
+    metadata:
+      labels: { app: result }
+    spec:
+      imagePullSecrets:
+        - name: ecr-creds
+      containers:
+        - name: result
+          image: __ECR__/result:__TAG__
+          ports:
+            - containerPort: 80
+              hostPort: 5001         # expose on the EC2 like before
+          env:
+            - name: POSTGRES_HOST
+              value: db
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: db, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: db, key: POSTGRES_PASSWORD } }
+            - name: POSTGRES_DB
+              valueFrom: { secretKeyRef: { name: db, key: POSTGRES_DB } }

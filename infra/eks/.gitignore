@@ -1,0 +1,8 @@
+# Terraform
+**/.terraform/**
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+# keep the lock file tracked:
+#! .terraform.lock.hcl

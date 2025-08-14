@@ -1,0 +1,55 @@
+name: Build & Push to ECR
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build & push VOTE
+      - name: Build & push vote
+        uses: docker/build-push-action@v5
+        with:
+          context: ./vote
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/vote:latest
+            ${{ secrets.ECR_REGISTRY }}/vote:${{ github.sha }}
+
+      # Build & push WORKER
+      - name: Build & push worker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/worker:latest
+            ${{ secrets.ECR_REGISTRY }}/worker:${{ github.sha }}
+
+      # Build & push RESULT
+      - name: Build & push result
+        uses: docker/build-push-action@v5
+        with:
+          context: ./result
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/result:latest
+            ${{ secrets.ECR_REGISTRY }}/result:${{ github.sha }}

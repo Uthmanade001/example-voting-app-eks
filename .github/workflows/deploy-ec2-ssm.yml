@@ -1,0 +1,134 @@
+name: Deploy to EC2 via SSM
+
+on:
+  workflow_run:
+    workflows: ["Build & Push to ECR"]   # must match your build workflow name
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+  POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+  POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-ec2
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Resolve IMAGE_TAG (built commit when auto-triggered)
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "IMAGE_TAG=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+          fi
+          echo "Using IMAGE_TAG=$IMAGE_TAG"
+
+      # Use the two files you added to the repo:
+      # infra/compose/dev/docker-compose.override.yml
+      # infra/compose/dev/nginx.conf
+      - name: Package proxy config from repo (base64)
+        id: pkg_cfg
+        shell: bash
+        run: |
+          set -e
+          base64 -w0 infra/compose/dev/docker-compose.override.yml > override.b64
+          base64 -w0 infra/compose/dev/nginx.conf > nginx.b64
+          echo "OVERRIDE_B64=$(cat override.b64)" >> $GITHUB_ENV
+          echo "NGINX_CONF_B64=$(cat nginx.b64)" >> $GITHUB_ENV
+
+      - name: Send SSM Run Command (deploy with Nginx + logs)
+        id: ssm
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy example-voting-app ${IMAGE_TAG} with Nginx" \
+            --parameters commands='[
+              "sudo systemctl enable --now docker || true",
+              "cd /opt/vote",
+
+              "aws logs create-log-group --log-group-name /example-voting-app || true",
+
+              "echo '"${OVERRIDE_B64}"' | base64 -d > docker-compose.override.yml",
+              "echo '"${NGINX_CONF_B64}"' | base64 -d > nginx.conf",
+
+              "echo ECR_REGISTRY='"${ECR_REGISTRY}"' > .env",
+              "echo IMAGE_TAG='"${IMAGE_TAG}"' >> .env",
+              "echo POSTGRES_USER='"${POSTGRES_USER}"' >> .env",
+              "echo POSTGRES_PASSWORD='"${POSTGRES_PASSWORD}"' >> .env",
+              "echo POSTGRES_DB='"${POSTGRES_DB}"' >> .env",
+
+              "aws ecr get-login-password --region '"${AWS_REGION}"' | docker login --username AWS --password-stdin '"${ECR_REGISTRY}"'",
+              "docker compose pull",
+              "docker compose up -d",
+              "docker compose ps"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+          echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
+          echo "SSM command sent: $CMD_ID"
+
+      - name: Wait for SSM command to finish
+        shell: bash
+        run: |
+          set -e
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          echo "Waiting on SSM Command: $CMD_ID"
+          for i in {1..40}; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" --details \
+              --query 'CommandInvocations[0].Status' --output text || true)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then exit 0; fi
+            if [[ "$STATUS" = "Cancelled" || "$STATUS" = "TimedOut" || "$STATUS" = "Failed" || "$STATUS" = "Undeliverable" || "$STATUS" = "Incomplete" ]]; then
+              echo "SSM command ended with status: $STATUS"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for SSM command to finish"
+          exit 1
+
+      - name: Fetch SSM logs
+        if: ${{ steps.ssm.outputs.command_id != '' }}
+        shell: bash
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+            --query '{Status:Status,StdOut:StandardOutputContent,StdErr:StandardErrorContent}' \
+            --output json
+
+      - name: Link to AWS Console
+        if: ${{ steps.ssm.outputs.command_id != '' }}
+        run: |
+          echo "Open in console:"
+          echo "https://${{ env.AWS_REGION }}.console.aws.amazon.com/systems-manager/run-command/${{ steps.ssm.outputs.command_id }}?region=${{ env.AWS_REGION }}"

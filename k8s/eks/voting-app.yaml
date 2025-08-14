@@ -1,0 +1,186 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: voting
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: voting
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: voting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-data
+  namespace: voting
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: { storage: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: voting
+spec:
+  selector: { app: db }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+# ===== DB (Postgres) — working config =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: voting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: db } }
+  template:
+    metadata: { labels: { app: db } }
+    spec:
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: fix-perms
+          image: busybox:1.36
+          command: ["sh","-c","chown -R 999:999 /var/lib/postgresql/data || true"]
+          volumeMounts:
+            - { name: db-storage, mountPath: /var/lib/postgresql/data }
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_USER,     value: "postgres" }
+            - { name: POSTGRES_PASSWORD, value: "postgres" }
+            - { name: POSTGRES_DB,       value: "votes" }
+            # initialize under a clean subfolder (avoids lost+found issue)
+            - { name: PGDATA,            value: "/var/lib/postgresql/data/pgdata" }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts:
+            - { name: db-storage, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: db-storage
+          persistentVolumeClaim: { claimName: db-data }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vote
+  namespace: voting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: vote } }
+  template:
+    metadata: { labels: { app: vote } }
+    spec:
+      containers:
+        - name: vote
+          image: dockersamples/examplevotingapp_vote:latest
+          ports: [{ containerPort: 80 }]
+          env:
+            - { name: REDIS_HOST, value: "redis" }
+            - { name: REDIS_PORT, value: "6379" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vote
+  namespace: voting
+spec:
+  type: LoadBalancer
+  selector: { app: vote }
+  ports:
+    - { name: http, port: 80, targetPort: 80 }
+---
+# ===== Result (reads from Postgres) — working config =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: result
+  namespace: voting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: result } }
+  template:
+    metadata: { labels: { app: result } }
+    spec:
+      containers:
+        - name: result
+          image: dockersamples/examplevotingapp_result:latest
+          ports: [{ containerPort: 80 }]
+          env:
+            # app's vars
+            - { name: POSTGRES_HOST,     value: "db" }
+            - { name: POSTGRES_PORT,     value: "5432" }
+            - { name: POSTGRES_USER,     value: "postgres" }
+            - { name: POSTGRES_PASSWORD, value: "postgres" }
+            - { name: POSTGRES_DB,       value: "votes" }
+            # common PG_* variants some builds expect
+            - { name: PGHOST,            value: "db" }
+            - { name: PGPORT,            value: "5432" }
+            - { name: PGUSER,            value: "postgres" }
+            - { name: PGPASSWORD,        value: "postgres" }
+            - { name: PGDATABASE,        value: "votes" }
+            # URL fallback used by some libs
+            - { name: DATABASE_URL,      value: "postgres://postgres:postgres@db:5432/votes" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: result
+  namespace: voting
+spec:
+  type: LoadBalancer
+  selector: { app: result }
+  ports:
+    - { name: http, port: 80, targetPort: 80 }
+---
+# ===== Worker (writes votes to Postgres) — working config =====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: voting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: worker } }
+  template:
+    metadata: { labels: { app: worker } }
+    spec:
+      containers:
+        - name: worker
+          image: dockersamples/examplevotingapp_worker:latest
+          env:
+            # Redis (both styles for compatibility)
+            - { name: REDIS_HOST, value: "redis" }
+            - { name: REDIS_PORT, value: "6379" }
+            - { name: REDIS,      value: "redis:6379" }
+            # Postgres (both styles for compatibility)
+            - { name: POSTGRES_HOST,     value: "db" }
+            - { name: POSTGRES_PORT,     value: "5432" }
+            - { name: POSTGRES_USER,     value: "postgres" }
+            - { name: POSTGRES_PASSWORD, value: "postgres" }
+            - { name: POSTGRES_DB,       value: "votes" }
+            - { name: POSTGRES,          value: "db" }

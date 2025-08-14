@@ -1,0 +1,88 @@
+services:
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  db:
+    image: postgres:16
+    env_file: [.env]
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    healthcheck:
+      # note the $$ to escape for docker-compose to pass through
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # one-off migration to ensure the 'votes' table exists
+  migrate:
+    image: postgres:16
+    depends_on:
+      db: { condition: service_healthy }
+    env_file: [.env]
+    entrypoint: >
+      /bin/sh -c "
+      until pg_isready -h db -U $POSTGRES_USER -d $POSTGRES_DB; do
+        echo 'Waiting for Postgres...'; sleep 1;
+      done;
+      echo 'Postgres is ready. Running migration...';
+      export PGPASSWORD=\"$POSTGRES_PASSWORD\";
+      psql -h db -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c
+      \"CREATE TABLE IF NOT EXISTS votes (
+          id   VARCHAR(255) PRIMARY KEY,
+          vote VARCHAR(1)   NOT NULL CHECK (vote IN ('a','b'))
+        );\";
+      echo 'Migration done.'
+      "
+    restart: "no"
+
+  vote:
+    build: ./vote
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      REDIS_HOST: redis
+    ports: ["5000:80"]  # vote listens on 80 internally
+
+  worker:
+    build: ./worker
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+  result:
+    build: ./result
+    depends_on:
+      db: { condition: service_healthy }
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["5001:80"]  # result listens on 80 internally
+
+volumes:
+  pgdata:
+

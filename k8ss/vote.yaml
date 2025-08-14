@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vote
+  namespace: voting
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vote }
+  template:
+    metadata:
+      labels: { app: vote }
+    spec:
+      imagePullSecrets:
+        - name: ecr-creds
+      containers:
+        - name: vote
+          image: __ECR__/vote:__TAG__
+          ports:
+            - containerPort: 80
+              hostPort: 5000         # expose on the EC2 like before
+          env:
+            - name: REDIS_HOST
+              value: redis
+            - name: REDIS_PORT
+              value: "6379"

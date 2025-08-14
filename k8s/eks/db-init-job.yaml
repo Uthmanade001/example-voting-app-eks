@@ -1,0 +1,24 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: voting
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: psql
+          image: postgres:16
+          env:
+            - name: PGPASSWORD
+              value: "postgres"
+          command: ["sh","-lc"]
+          args:
+            - >
+              psql -h db -U postgres -d votes
+              -c "CREATE TABLE IF NOT EXISTS votes (
+                    id VARCHAR(255) PRIMARY KEY,
+                    vote VARCHAR(255) NOT NULL
+                  );"

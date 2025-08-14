@@ -1,0 +1,81 @@
+name: Rollback deploy (EC2 via SSM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag or commit SHA to deploy"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+  POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+  POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy requested tag
+        id: ssm
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${EC2_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Rollback to ${IMAGE_TAG}" \
+            --parameters commands='[
+              "sudo systemctl enable --now docker || true",
+              "cd /opt/vote",
+              "echo ECR_REGISTRY='"${ECR_REGISTRY}"' > .env",
+              "echo IMAGE_TAG='"'"'"${IMAGE_TAG}"'"'"' >> .env",
+              "echo POSTGRES_USER='"${POSTGRES_USER}"' >> .env",
+              "echo POSTGRES_PASSWORD='"${POSTGRES_PASSWORD}"' >> .env",
+              "echo POSTGRES_DB='"${POSTGRES_DB}"' >> .env",
+              "aws ecr get-login-password --region '"${AWS_REGION}"' | docker login --username AWS --password-stdin '"${ECR_REGISTRY}"'",
+              "docker compose pull",
+              "docker compose up -d",
+              "docker compose ps"
+            ]' \
+            --query "Command.CommandId" --output text)
+          echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
+          echo "SSM command sent: $CMD_ID"
+
+      - name: Wait for completion
+        shell: bash
+        run: |
+          set -e
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          for i in {1..40}; do
+            STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details \
+              --query 'CommandInvocations[0].Status' --output text || true)
+            echo "SSM status: $STATUS"
+            [[ "$STATUS" == "Success" ]] && exit 0
+            [[ "$STATUS" =~ (Cancelled|TimedOut|Failed|Undeliverable|Incomplete) ]] && exit 1
+            sleep 10
+          done
+          echo "Timed out"; exit 1
+
+      - name: Fetch SSM logs
+        if: ${{ steps.ssm.outputs.command_id != '' }}
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+            --query '{Status:Status,StdOut:StandardOutputContent,StdErr:StandardErrorContent}' \
+            --output json
