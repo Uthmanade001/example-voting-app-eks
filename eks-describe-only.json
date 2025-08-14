@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DescribeTargetCluster",
+      "Effect": "Allow",
+      "Action": "eks:DescribeCluster",
+      "Resource": "arn:aws:eks:eu-west-2:389890955868:cluster/eks-voting-app"
+    },
+    {
+      "Sid": "OptionalListClusters",
+      "Effect": "Allow",
+      "Action": "eks:ListClusters",
+      "Resource": "*"
+    }
+  ]
+}
