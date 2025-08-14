@@ -26,14 +26,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Derive SHORT_SHA
-        run: echo "SHORT_SHA=${GITHUB_SHA::12}" >> $GITHUB_ENV
+      - name: Validate required variables
+        run: |
+          set -e
+          for v in AWS_REGION ACCOUNT_ID CLUSTER ROLE_ARN ECR_VOTE ECR_RESULT ECR_WORKER; do
+            test -n "${!v}" || { echo "::error::$v is empty"; exit 1; }
+            echo "$v=${!v}"
+          done
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Early EKS access check (fail fast)
+        run: |
+          set -e
+          aws eks describe-cluster --name "$CLUSTER" >/dev/null
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+          kubectl cluster-info
+          kubectl get nodes -o wide
 
       - name: Ensure ECR repos (idempotent)
         run: |
@@ -47,6 +60,9 @@ jobs:
         run: |
           aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_BASE"
 
+      - name: Derive SHORT_SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::12}" >> $GITHUB_ENV
+
       - name: Build & push images (vote, result, worker)
         run: |
           set -euo pipefail
@@ -56,9 +72,6 @@ jobs:
           docker push "$ECR_BASE/$ECR_VOTE:$SHORT_SHA"
           docker push "$ECR_BASE/$ECR_RESULT:$SHORT_SHA"
           docker push "$ECR_BASE/$ECR_WORKER:$SHORT_SHA"
-
-      - name: Kubeconfig → EKS
-        run: aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
 
       - name: Apply manifests (idempotent)
         run: |
@@ -127,7 +140,9 @@ jobs:
       - name: Troubleshooting snapshot (on failure)
         if: failure()
         run: |
+          set +e
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION" || true
           NS=voting
-          kubectl get nodes -o wide
-          kubectl -n "$NS" get deploy,svc,pods -o wide
-          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 100
+          kubectl get nodes -o wide || true
+          kubectl -n "$NS" get deploy,svc,pods -o wide || true
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 100 || true
