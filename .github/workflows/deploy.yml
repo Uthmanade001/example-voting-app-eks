@@ -1,0 +1,133 @@
+name: Build & Deploy Voting App to EKS
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
+  ROLE_ARN: ${{ vars.AWS_ROLE_TO_ASSUME }}
+  ECR_VOTE: ${{ vars.ECR_REPO_VOTE }}
+  ECR_RESULT: ${{ vars.ECR_REPO_RESULT }}
+  ECR_WORKER: ${{ vars.ECR_REPO_WORKER }}
+  ECR_BASE: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive SHORT_SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::12}" >> $GITHUB_ENV
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR repos (idempotent)
+        run: |
+          set -e
+          for R in "$ECR_VOTE" "$ECR_RESULT" "$ECR_WORKER"; do
+            aws ecr describe-repositories --repository-names "$R" >/dev/null 2>&1 || \
+              aws ecr create-repository --repository-name "$R" --image-scanning-configuration scanOnPush=true
+          done
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_BASE"
+
+      - name: Build & push images (vote, result, worker)
+        run: |
+          set -euo pipefail
+          docker build -t "$ECR_BASE/$ECR_VOTE:$SHORT_SHA"   ./vote
+          docker build -t "$ECR_BASE/$ECR_RESULT:$SHORT_SHA" ./result
+          docker build -t "$ECR_BASE/$ECR_WORKER:$SHORT_SHA" ./worker
+          docker push "$ECR_BASE/$ECR_VOTE:$SHORT_SHA"
+          docker push "$ECR_BASE/$ECR_RESULT:$SHORT_SHA"
+          docker push "$ECR_BASE/$ECR_WORKER:$SHORT_SHA"
+
+      - name: Kubeconfig → EKS
+        run: aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+
+      - name: Apply manifests (idempotent)
+        run: |
+          kubectl apply -f k8s/eks/gp3-storageclass.yaml
+          kubectl apply -f k8s/eks/voting-app.yaml -n voting || kubectl apply -f k8s/eks/voting-app.yaml
+
+      - name: Update deployment images
+        run: |
+          NS=voting
+          kubectl -n "$NS" set image deployment/vote   vote="$ECR_BASE/$ECR_VOTE:$SHORT_SHA"
+          kubectl -n "$NS" set image deployment/result result="$ECR_BASE/$ECR_RESULT:$SHORT_SHA"
+          kubectl -n "$NS" set image deployment/worker worker="$ECR_BASE/$ECR_WORKER:$SHORT_SHA"
+
+      - name: Wait for rollout
+        run: |
+          NS=voting
+          for d in vote result worker; do
+            kubectl -n "$NS" rollout status deployment/$d --timeout=180s
+          done
+
+      - name: Get ELB hostnames
+        id: elbs
+        run: |
+          NS=voting
+          VOTE_HOST=$(kubectl -n "$NS" get svc vote   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          RES_HOST=$(kubectl -n "$NS" get svc result -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "VOTE_HOST=$VOTE_HOST" >> $GITHUB_OUTPUT
+          echo "RES_HOST=$RES_HOST"   >> $GITHUB_OUTPUT
+          echo "Vote:   http://$VOTE_HOST"
+          echo "Result: http://$RES_HOST"
+
+      - name: Smoke test (in-cluster Job hits public URLs)
+        run: |
+          NS=voting
+          cat <<EOF | kubectl -n "$NS" apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: { name: smoke }
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: curl
+                  image: curlimages/curl:8.8.0
+                  args:
+                    - sh
+                    - -lc
+                    - |
+                      set -euo pipefail
+                      curl -fsS "http://${{ steps.elbs.outputs.VOTE_HOST }}/" >/dev/null
+                      curl -fsS "http://${{ steps.elbs.outputs.RES_HOST }}/" >/dev/null
+                      echo "OK"
+          EOF
+          kubectl -n "$NS" wait --for=condition=complete job/smoke --timeout=90s
+          kubectl -n "$NS" logs job/smoke || true
+          kubectl -n "$NS" delete job/smoke --ignore-not-found
+
+      - name: Summary
+        run: |
+          echo "Vote:   http://${{ steps.elbs.outputs.VOTE_HOST }}"
+          echo "Result: http://${{ steps.elbs.outputs.RES_HOST }}"
+          echo "Deployed SHA $SHORT_SHA ✔"
+
+      - name: Troubleshooting snapshot (on failure)
+        if: failure()
+        run: |
+          NS=voting
+          kubectl get nodes -o wide
+          kubectl -n "$NS" get deploy,svc,pods -o wide
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 100
