@@ -265,3 +265,6 @@ Notes:
 - DB Deployment pinned: PGDATA subdir + fsGroup + initContainer chown.
 - Worker/Result envs made explicit (Redis + Postgres).
 - Result: Public vote & result URLs work; votes reflect instantly. ✅
+
+## CI/CD
+[![Build & Deploy Voting App to EKS](https://github.com/Uthmanade001/example-voting-app-eks/actions/workflows/deploy.yml/badge.svg)](https://github.com/Uthmanade001/example-voting-app-eks/actions/workflows/deploy.yml)
