@@ -146,3 +146,21 @@ jobs:
           kubectl get nodes -o wide || true
           kubectl -n "$NS" get deploy,svc,pods -o wide || true
           kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 100 || true
+
+      - name: Enforce resources + probes (idempotent)
+        run: |
+          NS=voting
+          kubectl -n "$NS" set resources deployment/vote   --requests=cpu=100m,memory=256Mi --limits=cpu=500m,memory=512Mi
+          kubectl -n "$NS" set resources deployment/result --requests=cpu=100m,memory=256Mi --limits=cpu=500m,memory=512Mi
+          kubectl -n "$NS" set resources deployment/worker --requests=cpu=100m,memory=128Mi  --limits=cpu=300m,memory=256Mi
+          for d in vote result; do
+            kubectl -n "$NS" patch deploy "$d" --type=json -p='[
+              {"op":"remove","path":"/spec/template/spec/containers/0/livenessProbe"},
+              {"op":"remove","path":"/spec/template/spec/containers/0/readinessProbe"}
+            ]' >/dev/null 2>&1 || true
+            kubectl -n "$NS" patch deploy "$d" --type=json -p='[
+              {"op":"add","path":"/spec/template/spec/containers/0/livenessProbe","value":{"httpGet":{"path":"/","port":80},"initialDelaySeconds":15,"periodSeconds":10}},
+              {"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/","port":80},"initialDelaySeconds":5,"periodSeconds":5}}
+            ]'
+          done
+
