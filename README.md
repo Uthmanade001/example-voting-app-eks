@@ -66,3 +66,36 @@ A production-style deployment of the classic **Example Voting App** on **Amazon 
 - **Reliability:** Liveness/Readiness probes, resource requests/limits  
 - **Scaling:** HPA (vote & result) at 70% CPU (min 2, max 5)  
 - **Hygiene:** ECR lifecycle (keep last 10 images)
+
+## ⚙️ Prerequisites
+- Windows 11 + Git Bash  
+- Docker Desktop, kubectl, Terraform, AWS CLI v2  
+- AWS EKS cluster `eks-voting-app` (eu-west-2)  
+- IAM OIDC provider for `token.actions.githubusercontent.com`  
+- IAM role `github-eks-deployer` with:
+  - `AmazonEC2ContainerRegistryPowerUser`
+  - `AmazonEKSClusterPolicy`
+  - Inline policy for `eks:DescribeCluster` (and optional `ListClusters`)
+- ECR repos: `vote`, `result`, `worker`
+
+---
+
+## ��� CI/CD Pipeline (deploy.yml)
+**Flow:** OIDC assume role → ensure ECR repos → build & push (tag = short SHA) → kubeconfig → apply manifests → set images → wait rollout → smoke test → print URLs.
+
+**Variables (GitHub → Settings → Actions → Variables):**  
+`AWS_REGION, AWS_ACCOUNT_ID, EKS_CLUSTER_NAME, AWS_ROLE_TO_ASSUME, ECR_REPO_VOTE, ECR_REPO_RESULT, ECR_REPO_WORKER`
+
+**Triggers:** `push` to `main` and `workflow_dispatch`.
+
+## 🛠️ Operations Cheatsheet
+```bash
+# Public endpoints
+kubectl -n voting get svc vote   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
+kubectl -n voting get svc result -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
+
+# Current images (12-char SHA tags)
+kubectl -n voting get deploy vote   -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+kubectl -n voting get deploy result -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+kubectl -n voting get deploy worker -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+
