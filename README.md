@@ -20,34 +20,6 @@ A production-style deployment of the classic **Example Voting App** on **Amazon 
 - **Scalability**: HPA on `vote` & `result` at 70% CPU (min 2, max 5).
 - **Hygiene**: ECR lifecycle — keep last 10 images.
 
----
-
-## 🏗️ Architecture (Mermaid)
-```mermaid
-flowchart LR
-  subgraph GitHub Actions
-    A[Checkout] --> B[OIDC → Assume Role]
-    B --> C[Build 3 images]
-    C --> D[Push to ECR]
-    D --> E[aws eks update-kubeconfig]
-    E --> F[kubectl apply + set image]
-    F --> G[Smoke test Job]
-  end
-
-  subgraph AWS
-    ECR[(ECR: vote/result/worker)]
-    EKS[(EKS: eks-voting-app)]
-    ELB1[(ELB: /vote)]
-    ELB2[(ELB: /result)]
-  end
-
-  C --> ECR
-  F --> EKS
-  EKS --> ELB1
-  EKS --> ELB2
-
-
-
 # Example Voting App — AWS EKS + CI/CD
 
 [![Build & Deploy Voting App to EKS](https://github.com/Uthmanade001/example-voting-app-eks/actions/workflows/deploy.yml/badge.svg)](https://github.com/Uthmanade001/example-voting-app-eks/actions/workflows/deploy.yml)
