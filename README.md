@@ -1,4 +1,4 @@
-cat > README.md <<'MD'
+
 # Example Voting App — AWS EKS + CI/CD
 
 [![Build & Deploy Voting App to EKS](https://github.com/Uthmanade001/example-voting-app-eks/actions/workflows/deploy.yml/badge.svg)](https://github.com/Uthmanade001/example-voting-app-eks/actions/workflows/deploy.yml)
